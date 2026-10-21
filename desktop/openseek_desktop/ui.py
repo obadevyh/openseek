@@ -15,7 +15,7 @@ from PySide6.QtGui import (QAction, QBrush, QColor, QFont, QFontMetrics, QGuiApp
                            QPainter, QPainterPath, QPen, QPixmap, QPixmapCache)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
                                QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListView, QMainWindow, QMenu,
-                               QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QStackedWidget,
+                               QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSlider, QStackedWidget,
                                QStyle, QStyledItemDelegate, QStyleOptionViewItem, QSystemTrayIcon, QTreeWidget, QTreeWidgetItem,
                                QVBoxLayout, QWidget)
 
@@ -180,7 +180,7 @@ class Poller(QThread):
             s["online"] = s["health"] is not None
             s["procs"] = len(core.server_processes(self.cfg)) if n % 3 == 0 else None
             for key, path in (("status", "/admin/status"), ("metrics", "/admin/metrics"), ("sharing", "/admin/sharing"),
-                              ("contrib", "/admin/contributions")):
+                              ("contrib", "/admin/contributions"), ("thumbs", "/admin/thumbnails")):
                 s[key] = self.admin.get(path)
             if n % 3 == 0:
                 s["devices"] = self.admin.get("/admin/devices")
@@ -1484,6 +1484,8 @@ class SettingsPage(QWidget):
         save.setObjectName("primary")
         al.addWidget(save, 6, 2)
         lay.addWidget(app)
+        self.thumbs = ThumbQualityCard(win)
+        lay.addWidget(self.thumbs.box)
         self.simple_server = card()
         ssl_ = QVBoxLayout(self.simple_server)
         ssl_.setContentsMargins(20, 16, 20, 16)
@@ -1552,6 +1554,7 @@ class SettingsPage(QWidget):
         self.win.toast("Saved.")
 
     def update_snapshot(self, s, entries):
+        self.thumbs.update_snapshot(s)
         info = core.install_info()
         if info:
             if time.time() - getattr(self, "_svc_t", 0) > 8:
@@ -1765,6 +1768,80 @@ class ConnectTVDialog(QDialog):
                     self.count.setText("")
                     self.status.setStyleSheet(f"color: {GOOD}; font-weight: 600;")
                     self.status.setText(f"✓ Connected: {new[0].get('name', 'your TV')}. You can close this window.")
+
+
+class ThumbQualityCard:
+    """Seek-thumbnail quality: a four-step slider. Applied live by the server (no restart) and kept in its database."""
+
+    def __init__(self, win):
+        self.win = win
+        self._sent: str | None = None          # last preset sent and not yet confirmed by a snapshot
+        self.box = card()
+        g = QGridLayout(self.box)
+        g.setContentsMargins(20, 16, 20, 16)
+        g.setVerticalSpacing(10)
+        g.addWidget(label("Thumbnail quality", "h2"), 0, 0)
+        self.value = label("", muted=True)
+        g.addWidget(self.value, 0, 1, 1, 3, Qt.AlignRight)
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(0, len(core.THUMB_PRESETS) - 1)
+        self.slider.setPageStep(1)
+        self.slider.setTickPosition(QSlider.NoTicks)
+        self.slider.setCursor(Qt.PointingHandCursor)
+        g.addWidget(self.slider, 1, 0, 1, 4)
+        for i, (_n, lab, _w, _h) in enumerate(core.THUMB_PRESETS):
+            g.addWidget(label(lab, "faint"), 2, i, Qt.AlignLeft if i == 0 else Qt.AlignRight if i == len(core.THUMB_PRESETS) - 1 else Qt.AlignHCenter)
+        g.addWidget(label("Sharper seek previews on your TV. Higher quality uses more disk space for the cache, more bandwidth to the TV and "
+                          "more processing on this PC. Standard is the default. Thumbnails already made at another quality are kept and shown "
+                          "until the new ones are ready; the server applies a change straight away, without a restart.", "faint", wrap=True),
+                    3, 0, 1, 4)
+        self._timer = QTimer(self.box)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(400)               # one request per settled choice, not one per step while dragging
+        self._timer.timeout.connect(self._send)
+        self.slider.valueChanged.connect(self._moved)
+        self.slider.sliderReleased.connect(self._timer.start)
+        self._busy = True
+        self.slider.setValue(core.thumb_index(core.THUMB_DEFAULT))
+        self._busy = False
+        self._show(self.slider.value())
+        self.slider.setEnabled(False)
+
+    def _show(self, i: int) -> None:
+        _n, lab, w, h = core.THUMB_PRESETS[i]
+        self.value.setText(f"{lab} · {w}×{h}")
+
+    def _moved(self, i: int) -> None:
+        self._show(i)
+        if not self._busy and not self.slider.isSliderDown():
+            self._timer.start()
+
+    def _send(self) -> None:
+        name = core.THUMB_PRESETS[self.slider.value()][0]
+        r = self.win.admin.call("PUT", "/admin/thumbnails", {"quality": name})
+        if r is None or r.get("_error"):
+            self._sent = None
+            self.win.toast("Could not change the thumbnail quality (server offline, or restart OpenSeek once to enable it).")
+            return
+        self._sent = r.get("quality", name)
+        self.win.toast(f"Thumbnail quality: {core.THUMB_PRESETS[core.thumb_index(self._sent)][1]}.")
+
+    def update_snapshot(self, s) -> None:
+        t = s.get("thumbs")
+        ok = bool(t) and not t.get("_error")
+        self.slider.setEnabled(ok)
+        if not ok or self.slider.isSliderDown() or self._timer.isActive():
+            return                                  # never move the slider under the person's hand
+        name = t.get("quality")
+        if self._sent is not None and name != self._sent:
+            return                                  # an older snapshot, taken before the change landed
+        self._sent = None
+        i = core.thumb_index(name)
+        if i != self.slider.value():
+            self._busy = True
+            self.slider.setValue(i)
+            self._busy = False
+            self._show(i)
 
 
 class ServerSettingsCard:

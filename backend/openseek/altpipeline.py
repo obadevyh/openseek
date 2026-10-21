@@ -99,6 +99,7 @@ def validate(mgr, src, cap_b: str, size_b: int, fmt_b: str, dur_a_ms: int) -> tl
     engines_b: list[WorkerEngine] = []
     reused = [0]
     lock = threading.Lock()
+    quality = src.quality                                   # validation reads render at the source's preset
 
     def keep_tile(t_req: int, pts: int, jpeg: bytes) -> None:
         """A validation read is also a finished tile when it lands within tolerance of its slot: store it so the
@@ -108,18 +109,22 @@ def validate(mgr, src, cap_b: str, size_b: int, fmt_b: str, dur_a_ms: int) -> tl
         if sch is None or not 0 <= k < sch.n or abs(pts - k * 10_000) > s.tolerance_ms or k in sch.done:
             return
         try:
-            mgr.cache.put_tile(src.fp, k, pts, jpeg)
+            mgr.cache.put_tile(src.fp, k, pts, jpeg, quality)
         except (ValueError, OSError):
             return
         with src.cond:
+            if src.scheduler is not sch:                    # the quality changed meanwhile
+                return
             sch.mark_done(k)
             src.cond.notify_all()
         with lock:
             reused[0] += 1
 
     def mk(url_cap: str, size: int, fmt: str) -> WorkerEngine:
-        return WorkerEngine(mgr.proxy.url(url_cap), size, fmt, s.open_timeout_s, s.frame_timeout_s,
-                            s.max_dimension, s.max_duration_s, 5000)
+        eng = WorkerEngine(mgr.proxy.url(url_cap), size, fmt, s.open_timeout_s, s.frame_timeout_s,
+                           s.max_dimension, s.max_duration_s, 5000)
+        eng.set_thumb(quality.wire())
+        return eng
     try:
         for _ in range(pool_n):
             engines_a.append(mk(src.proxy_cap, src.size, src.fmt))
@@ -165,6 +170,7 @@ class SwitchEngine:
         self.a: WorkerEngine = make_a(src)
         self.b: WorkerEngine | None = None
         self._b_for: str | None = None
+        self.thumb = None
 
     # ---- WorkerEngine surface used by the runner
     @property
@@ -190,6 +196,12 @@ class SwitchEngine:
     def grab_batch(self, targets_ms, tolerance_ms: int = 5000):
         return self.a.grab_batch(targets_ms, tolerance_ms)
 
+    def set_thumb(self, wire) -> None:
+        self.thumb = wire
+        for e in (self.a, self.b):
+            if e is not None:
+                e.set_thumb(wire)
+
     def keyframe_index(self):
         return self.a.keyframe_index()
 
@@ -205,6 +217,7 @@ class SwitchEngine:
             s = self.mgr.settings
             self.b = WorkerEngine(self.mgr.proxy.url(alt.cap), alt.size, alt.fmt, s.open_timeout_s, s.frame_timeout_s,
                                   s.max_dimension, s.max_duration_s, alt.tol_b, nearest_kf=True)
+            self.b.set_thumb(self.thumb)
             self.b.open()
             self._b_for = alt.cid
         return self.b

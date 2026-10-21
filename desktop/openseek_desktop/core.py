@@ -51,6 +51,18 @@ _SERVER_RULES = {"port": (int, 1024, 65535), "admin_port": (int, 1024, 65535), "
                  "public_port": (int, 0, 65535), "host": (str,), "public_bind": (str,), "public_host": (str,), "log_level": (str,)}
 
 
+# thumbnail quality presets (the server's backend/openseek/quality.py is the authority; this copy only labels the slider while
+# the server is offline). The setting itself lives in the server's database: changed live over the admin API, kept across restarts.
+THUMB_PRESETS = [("low", "Low", 160, 90), ("standard", "Standard", 320, 180), ("high", "High", 480, 270), ("max", "Max", 640, 360)]
+THUMB_DEFAULT = "standard"
+
+
+def thumb_index(name) -> int:
+    """Slider position of a preset name; missing or unknown names mean the default (Standard)."""
+    names = [p[0] for p in THUMB_PRESETS]
+    return names.index(name) if name in names else names.index(THUMB_DEFAULT)
+
+
 def install_info() -> dict | None:
     try:
         j = json.loads(INSTALL_JSON.read_text(encoding="utf-8-sig"))
@@ -409,7 +421,7 @@ class Library:
             tabs = {r[0] for r in con.execute("select name from sqlite_master where type='table'")}
             meta = "release_meta" in tabs
             q = ("select e.fp,e.duration_ms,e.n_tiles,e.bytes,e.created,e.last_used,"
-                 "(select count(*) from tiles t where t.fp=e.fp)" +
+                 "(select count(distinct k) from tiles t where t.fp=e.fp)" +
                  (",m.imdb_id,m.tmdb_id,m.season,m.episode from entries e left join release_meta m on m.fp=e.fp"
                   if meta else " from entries e"))
             out = []

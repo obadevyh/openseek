@@ -6,6 +6,9 @@
 * The runner thread of a source pulls tasks from its `Scheduler`, drives the worker, applies
   the ±tolerance rule (keyframe first; accurate re-extract if the keyframe is too far), publishes
   tiles to the cache, and recovers from worker crashes/timeouts with backoff.
+* A source generates at ONE thumbnail quality (the owner's preset). When the preset changes, its
+  scheduler is rebuilt from the tiles already cached at the new quality (nothing is deleted, the
+  worker keeps running); a frame already in flight is stored under the quality it was rendered at.
 """
 from __future__ import annotations
 
@@ -34,6 +37,7 @@ from .guard import GuardLimits, PlaybackGuard
 from .fetch import Budget, Preflight, ProxySource, RangeProxy, TokenBucket, Upstream, UpstreamError
 from .ids import new_preview_id
 from .netpolicy import Denied, DestinationPolicy
+from .quality import Quality
 from .scheduler import Scheduler, Task, tile_count
 from .worker import WorkerEngine, WorkerError
 
@@ -158,7 +162,9 @@ class Source:
         self._tile_failures: dict[int, int] = {}
         self._crashes = 0
         self._unreachable = 0
-        e = mgr.cache.entry(fp)
+        self._priority: tuple[int | None, int | None] = (None, None)
+        self.quality: Quality = mgr.quality       # the preset this source generates
+        e = mgr.cache.entry(fp, self.quality)
         if e is not None and e.n_tiles:
             self.scheduler = mgr.new_scheduler(e.n_tiles, set(e.tiles))
 
@@ -307,6 +313,7 @@ class Source:
                 if self._pl_last is not None and abs(playhead_ms - (self._pl_last + (now - self._pl_t) * 1000.0)) > 4000:
                     self.last_seek_at = now              # the playhead jumped: a skip or a seek
                 self._pl_last, self._pl_t = playhead_ms, now
+            self._priority = (at_ms, playhead_ms)
             if self.scheduler is None:
                 self.pending_priority = (at_ms, playhead_ms)
             else:
@@ -318,6 +325,24 @@ class Source:
                 self._sync_background()
             self.cond.notify_all()
 
+    def apply_quality(self, q: Quality) -> bool:
+        """Generate at `q` from now on. The scheduler restarts from the tiles cached at `q` (none are deleted);
+        frames already in flight finish and are stored under their own quality. True when something changed."""
+        with self.cond:
+            if q == self.quality:
+                return False
+            self.quality = q
+            if self.scheduler is not None:
+                e = self.mgr.cache.entry(self.fp, q)
+                self.scheduler = self.mgr.new_scheduler(self.scheduler.n, set(e.tiles) if e else set())
+                if self._priority != (None, None):
+                    self.scheduler.set_priority(*self._priority)
+            self._tile_failures.clear()
+            self._sync_background()
+            self.cond.notify_all()
+        log.info("source %s.. now generating %s thumbnails", self.fp[:8], q.name)
+        return True
+
     def tile_lost(self, k: int) -> None:
         with self.cond:
             if self.scheduler is not None:
@@ -326,6 +351,7 @@ class Source:
 
     # ---------------------------------------------------------------- lifecycle
     def start(self) -> bool:
+        self.apply_quality(self.mgr.quality)
         with self.lock:
             if self.running or self.error is not None or self.upstream is None:
                 return False
@@ -394,7 +420,8 @@ class Source:
         with self.cond:
             self.active_tasks.pop(worker_idx, None)
             self._sync_background()
-            if task is not None and self.scheduler is not None:
+            # a task of a scheduler replaced meanwhile (quality change) must not mark anything in the new one
+            if task is not None and self.scheduler is not None and self.scheduler.inflight_tasks.get(task.k) is task:
                 self.scheduler.complete(task, ok=ok, permanent_failure=permanent)
                 if ok and self.guard is not None and task.cls != "P0":
                     self.guard.note_tile_done()
@@ -477,6 +504,10 @@ class Source:
                 throttle_before = self.proxy_src.throttle_seconds
                 keyframe_seconds = accurate_seconds = 0.0
                 worker_reqs = worker_bytes = 0
+                quality = self.quality                     # the tile is rendered (and stored) at this preset
+                set_thumb = getattr(eng, "set_thumb", None)
+                if set_thumb is not None:
+                    set_thumb(quality.wire())
                 try:
                     res = eng.grab(task.t_ms, accurate=False)
                     keyframe_seconds = time.perf_counter() - t0
@@ -530,7 +561,7 @@ class Source:
                     self._finish(worker_idx, task, ok=False, permanent=True)   # never publish out of tolerance
                     continue
                 try:
-                    mgr.cache.put_tile(self.fp, task.k, res.pts_ms, res.jpeg)
+                    mgr.cache.put_tile(self.fp, task.k, res.pts_ms, res.jpeg, quality)
                 except (ValueError, OSError) as e:
                     log.warning("could not store tile: %s", type(e).__name__)
                     self._finish(worker_idx, task, ok=False, permanent=True)
@@ -597,7 +628,7 @@ class Source:
         n = tile_count(info.duration_ms)
         with self.cond:
             if self.scheduler is None or self.scheduler.n != n:
-                e = mgr.cache.entry(self.fp)
+                e = mgr.cache.entry(self.fp, self.quality)
                 self.scheduler = mgr.new_scheduler(n, set(e.tiles) if e else set())
             if self.pending_priority is not None:
                 self.scheduler.set_priority(*self.pending_priority)
@@ -643,6 +674,7 @@ class JobManager:
             self.alt_bucket = self.bucket
         self.alt_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="openseek-alt")
         self.engine_factory = engine_factory or self._default_engine
+        self.quality: Quality = cache.quality         # the owner's thumbnail preset (see set_quality)
         self.jobs: dict[str, Job] = {}
         self.sources: dict[str, Source] = {}
         self.url_index: dict[tuple[str, str], Job] = {}
@@ -678,6 +710,40 @@ class JobManager:
 
     def bump(self) -> None:
         self._version_tick += 1
+
+    def set_quality(self, q: Quality) -> bool:
+        """Switch the thumbnail preset live. Caches of every quality are kept; sources being watched carry on at
+        `q` from the tiles already cached at `q`; idle ones pick it up when next started. True if it changed."""
+        with self.lock:
+            if q == self.quality:
+                return False
+            self.quality = q
+            self.cache.quality = q
+            sources = list(self.sources.values())
+        self.cache.bump_versions()                  # clients re-read the VTT: it now prefers the new quality
+        for src in sources:
+            src.apply_quality(q)
+            with self.lock:
+                owners = [self.jobs[p] for p in src.jobs if p in self.jobs and not self.jobs[p].deleted]
+                watched = self.clock() - src.last_activity < self.settings.idle_timeout_s
+                if owners and watched and not src.running and not self._stop.is_set():
+                    self._ensure_running(src, owners[0].device_id)
+        self.bump()
+        return True
+
+    def fallback_tiles(self, fp: str) -> list[tuple[Quality, dict[int, int]]]:
+        """Tiles of this fingerprint cached at qualities other than the active one, nearest size first (larger
+        first on a tie): the VTT uses them for slots the active quality has not made yet."""
+        q = self.quality
+        others = [o for o in self.cache.cached_qualities(fp) if o != q]
+        others.sort(key=lambda o: (abs(o.w - q.w), -o.w))
+        out = []
+        for o in others:
+            e = self.cache.entry(fp, o)
+            if e is not None and e.tiles:
+                with e.lock:
+                    out.append((o, dict(e.tiles)))
+        return out
 
     def _tile_lost(self, fp: str, k: int) -> None:
         """Cache callback (may run under cache locks): hand off to a thread, then regenerate."""
@@ -1050,10 +1116,12 @@ class JobManager:
         tiles = len(e.tiles) if e else 0
         n = e.n_tiles if e else None
         sch = src.scheduler if src else None
+        if src is not None and src.quality != self.quality:
+            sch = None                                  # its scheduler still counts the previous quality
         if n and (tiles >= n or (sch is not None and sch.complete_all)):
             return "complete", None
-        if tiles:
-            return "ready", None
+        if tiles or (e is not None and self.cache.cached_qualities(job.fp)):
+            return "ready", None                        # (the VTT shows other qualities' tiles meanwhile)
         return "preparing", None
 
     def snapshot(self, job: Job) -> dict:

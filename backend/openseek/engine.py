@@ -6,8 +6,8 @@ sequential access, LRU block cache) to the backend's loopback range proxy - neve
 network. Decoder: slice threading, probesize 256 KiB, analyzeduration 0.5 s; keyframe seek
 backwards and take the first decoded frame; accurate mode decodes forward to the target.
 HDR (PQ/HLG) is tonemapped to SDR at thumbnail size (numpy Hable; PyAV wheels lack zscale).
-Thumbnails: fit inside 320x180 preserving display aspect, letter/pillarbox to exactly 320x180,
-JPEG quality 75.
+Thumbnails: fit inside the preset's box (default Standard, 320x180) preserving display aspect,
+letter/pillarbox to exactly that box, at the preset's JPEG quality (Standard: 75). See quality.py.
 """
 from __future__ import annotations
 
@@ -17,8 +17,10 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
-THUMB_W, THUMB_H = 320, 180
-JPEG_QUALITY = 75
+from .quality import STANDARD
+
+THUMB_W, THUMB_H = STANDARD.w, STANDARD.h
+JPEG_QUALITY = STANDARD.jpeg_q
 FORMAT_DEMUXER = {"matroska": "matroska", "mp4": "mov"}
 FORMAT_ALLOW = ("matroska", "webm", "mov", "mp4")
 TRC_PQ, TRC_HLG = 16, 18
@@ -169,12 +171,12 @@ class ProxyReader(io.RawIOBase):
         super().close()
 
 
-def fit_box(w: int, h: int, sar: float = 1.0) -> tuple[int, int]:
-    """Largest size inside 320x180 with the source's display aspect ratio."""
+def fit_box(w: int, h: int, sar: float = 1.0, box_w: int = THUMB_W, box_h: int = THUMB_H) -> tuple[int, int]:
+    """Largest size inside box_w x box_h (default 320x180) with the source's display aspect ratio."""
     dw = max(1.0, w * (sar if sar and sar > 0 else 1.0))
-    s = min(THUMB_W / dw, THUMB_H / max(1, h))
-    sw = max(2, min(THUMB_W, int(round(dw * s))))
-    sh = max(2, min(THUMB_H, int(round(h * s))))
+    s = min(box_w / dw, box_h / max(1, h))
+    sw = max(2, min(box_w, int(round(dw * s))))
+    sh = max(2, min(box_h, int(round(h * s))))
     return sw, sh
 
 
@@ -247,8 +249,16 @@ class Extractor:
         self._last_pts_ms: int | None = None
         self._last_kf_entry_ts: int | None = None
         self._last_kf_result: tuple[int, bytes] | None = None
+        self.thumb = (THUMB_W, THUMB_H, JPEG_QUALITY)
         if dur > 0 and getattr(self.reader, "size", 0) > 0 and hasattr(self.reader, "configure_for_bitrate"):
             self.reader.configure_for_bitrate(self.reader.size / dur)
+
+    def set_thumb(self, w: int, h: int, q: int) -> None:
+        """Tile geometry and JPEG quality for the following grabs (a quality preset; see quality.py)."""
+        if (w, h, q) != self.thumb:
+            self.thumb = (int(w), int(h), int(q))
+            if self._last_kf_result is not None and self._last_kf_result[1]:
+                self._last_kf_result = None          # a cached frame rendered at the previous geometry
 
     def info(self) -> MediaInfo:
         return MediaInfo(self.duration_ms, self.width, self.height, self.vs.codec_context.name, self.hdr,
@@ -468,15 +478,16 @@ class Extractor:
         from PIL import Image
 
         sar = float(frame.sample_aspect_ratio) if getattr(frame, "sample_aspect_ratio", None) else self.sar
-        sw, sh = fit_box(frame.width, frame.height, sar)
+        tw, th, tq = self.thumb
+        sw, sh = fit_box(frame.width, frame.height, sar, tw, th)
         if self.hdr:
             img = self._tonemap(frame, sw, sh)
         else:
             img = self._to_rgb(frame, sw, sh)
-        canvas = Image.new("RGB", (THUMB_W, THUMB_H))
-        canvas.paste(img, ((THUMB_W - sw) // 2, (THUMB_H - sh) // 2))
+        canvas = Image.new("RGB", (tw, th))
+        canvas.paste(img, ((tw - sw) // 2, (th - sh) // 2))
         out = io.BytesIO()
-        canvas.save(out, "JPEG", quality=JPEG_QUALITY)
+        canvas.save(out, "JPEG", quality=tq)
         return out.getvalue()
 
     def _to_rgb(self, frame, sw: int, sh: int):

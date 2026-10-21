@@ -41,6 +41,7 @@ from .logutil import plain, setup_logging
 from .netpolicy import DestinationPolicy, filter_forwarded_headers
 from .pairing import PairingClosed, PairingFailed, PairingManager, RateLimited
 from .public import PublicLimiter, classify
+from . import quality as thumbq
 from .contrib import ContributionPolicy, Spacing, clean_hosts
 from .tls import ensure_certificate
 from .vtt import LAYOUTS, render
@@ -72,7 +73,9 @@ class Core:
         self.data_dir = Path(settings.data_dir)
         secure_mkdir(self.data_dir)
         self.db = DB(self.data_dir / "openseek.db")
-        self.cache = Cache(self.data_dir, self.db, settings.cache_max_bytes, settings.retention_days)
+        # the owner's thumbnail preset survives restarts in the settings table; missing or unknown: Standard
+        self.cache = Cache(self.data_dir, self.db, settings.cache_max_bytes, settings.retention_days,
+                           quality=thumbq.parse(self.db.get_setting(thumbq.SETTING_KEY)))
         self.cert_path, self.key_path, self.spki_pin = ensure_certificate(self.data_dir)
         self.caps = CapSigner(load_or_create_secret(self.data_dir / "secret.key"))
         self.admin_token = admin_token(self.data_dir, settings.admin_token)
@@ -94,6 +97,10 @@ class Core:
 
     def contributions_enabled(self) -> bool:
         return self.sharing_enabled() and self.db.get_setting("contrib_enabled") == "1"
+
+    def set_thumb_quality(self, q: thumbq.Quality) -> None:
+        self.db.set_setting(thumbq.SETTING_KEY, q.name)
+        self.jobs.set_quality(q)
 
     def contrib_hosts(self) -> list[str]:
         raw = self.db.get_setting("contrib_hosts")
@@ -498,6 +505,11 @@ class SharingIn(BaseModel):
     enabled: StrictBool
 
 
+class ThumbQualityIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    quality: Literal["low", "standard", "high", "max"]
+
+
 # ===================================================================== API app
 def create_api_app(core: Core, public: bool = False) -> FastAPI:
     app = FastAPI(title="OpenSeek", version=__version__, docs_url=None, redoc_url=None, openapi_url=None,
@@ -764,6 +776,11 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
         return Response(status_code=204)
 
     # ---------------------------------------------------------------- data plane
+    def url_quality(request: Request) -> thumbq.Quality | None:
+        """The quality an image URL names (`q=`; absent = Standard, the original URLs). None: unknown."""
+        name = request.query_params.get("q")
+        return thumbq.STANDARD if name is None else thumbq.BY_NAME.get(name)
+
     def data_access(request: Request, cap: str, preview_id: str):
         """Returns (device_id, fp, job) when the capability (or Bearer) grants access, else None."""
         if not is_preview_id(preview_id):
@@ -802,12 +819,19 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
             return err(400, "bad_request")
         if job is not None:
             jobs.touch(job)
-        e = core.cache.entry(fp) if fp else None
+        q = core.jobs.quality
+        e = core.cache.entry(fp, q) if fp else None
         exp = core.caps.current_exp()
         m = core.library.mapping_for(preview_id) if job is None else None      # a borrowed preview: remap onto the guest's timeline
+        if e is not None:
+            with e.lock:
+                tiles = dict(e.tiles)
+        else:
+            tiles = {}
+        fallback = await asyncio.to_thread(core.jobs.fallback_tiles, fp) if e is not None else []
         text = render(base, core.caps.cap(dev, preview_id, exp), preview_id, exp, layout,
-                      dict(e.tiles) if e else {}, e.duration_ms if e else None, e.n_tiles if e else None,
-                      s.tolerance_ms, (m[0], m[1], m[2]) if m is not None else None)
+                      tiles, e.duration_ms if e else None, e.n_tiles if e else None,
+                      s.tolerance_ms, (m[0], m[1], m[2]) if m is not None else None, q, fallback)
         return Response(text, media_type="text/vtt; charset=utf-8", headers={"Cache-Control": "no-store"})
 
     @app.get("/v1/c/{cap}/{preview_id}/tiles/{name}")
@@ -817,9 +841,10 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
             return err(403, "forbidden")
         dev, fp, job = acc
         k = parse_index(name[:-4]) if name.endswith(".jpg") else None
-        if k is None or fp is None:
+        q = url_quality(request)
+        if k is None or fp is None or q is None:
             return err(404, "not_found")
-        data = await asyncio.to_thread(core.cache.tile_bytes, fp, k)
+        data = await asyncio.to_thread(core.cache.tile_bytes, fp, k, q)
         if data is None:
             return err(404, "not_found")
         if job is not None:
@@ -833,9 +858,10 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
             return err(403, "forbidden")
         dev, fp, job = acc
         n = parse_index(name[:-4], 99_999) if name.endswith(".jpg") else None
-        if n is None or fp is None:
+        q = url_quality(request)
+        if n is None or fp is None or q is None:
             return err(404, "not_found")
-        got = await asyncio.to_thread(core.cache.sheet_bytes, fp, n)
+        got = await asyncio.to_thread(core.cache.sheet_bytes, fp, n, q)
         if got is None:
             return err(404, "not_found")
         if job is not None:
@@ -999,6 +1025,7 @@ def create_admin_app(core: Core) -> FastAPI:
                 })
         return {"monotonic": core.jobs.clock(), "failed_jobs": failed_jobs, "config": {
             "bg_mbps": core.settings.bg_mbps, "pregen": core.settings.pregen,
+            "thumb_quality": core.jobs.quality.name,
             "upstream_rps": core.settings.upstream_rps,
             "p2_pause_s": core.settings.p2_pause_s,
             "p1_interleave": core.settings.p1_interleave,
@@ -1030,6 +1057,17 @@ def create_admin_app(core: Core) -> FastAPI:
         if not body.enabled:
             await asyncio.to_thread(core.jobs.stop_contributions)       # the kill switch stops guest extraction too
         return {"enabled": core.sharing_enabled()}
+
+    @app.get("/admin/thumbnails")
+    async def thumbnails_get():
+        return {"quality": core.jobs.quality.name, "default": thumbq.DEFAULT.name,
+                "presets": [q.public() for q in thumbq.PRESETS]}
+
+    @app.put("/admin/thumbnails")
+    async def thumbnails_set(body: ThumbQualityIn):
+        """Live: no restart. Thumbnails cached at other qualities are kept (and shown until replaced)."""
+        await asyncio.to_thread(core.set_thumb_quality, thumbq.BY_NAME[body.quality])
+        return await thumbnails_get()
 
     @app.get("/admin/contributions")
     async def contributions_get():

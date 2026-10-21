@@ -11,7 +11,8 @@ Protocol (one JSON object per line):
   -> {"op":"open","url":"http://127.0.0.1:P/j/<cap>","size":N,"format":"matroska","max_dim":8192,
       "max_duration_s":43200}
   <- {"ok":true,"duration_ms":..,"width":..,"height":..,"codec":"h264","hdr":false,"container":".."}
-  -> {"op":"grab","t_ms":4800000,"accurate":false}
+  -> {"op":"grab","t_ms":4800000,"accurate":false,"thumb":[320,180,75]}
+     ("thumb" = [width, height, JPEG quality] of a quality preset; absent: Standard. Also on grab_batch.)
   <- {"ok":true,"pts_ms":4797960,"jpeg":"<base64>","requests":2,"bytes":812345}
   <- {"ok":false,"error":"not_video|unsupported_codec|upstream|internal","detail":".."}
 """
@@ -49,8 +50,16 @@ def main() -> None:  # pragma: no cover - exercised through subprocess in integr
     except Exception:  # noqa: BLE001
         pass
     from .engine import EngineError, Extractor, ProxyReader
+    from .quality import from_wire
 
     ex = None
+
+    def thumb(msg: dict) -> None:
+        if "thumb" in msg:
+            q = from_wire(msg["thumb"])
+            if q is None:
+                raise EngineError("internal", "bad_thumb")      # only the presets' exact geometries are rendered
+            ex.set_thumb(q.w, q.h, q.jpeg_q)
 
     def reply(obj: dict) -> None:
         out.write(json.dumps(obj, separators=(",", ":")) + "\n")
@@ -73,6 +82,7 @@ def main() -> None:  # pragma: no cover - exercised through subprocess in integr
             elif op == "grab":
                 if ex is None:
                     raise EngineError("internal", "not_open")
+                thumb(msg)
                 q0, b0 = ex.reader.requests, ex.reader.bytes_fetched
                 tol_ms = int(msg.get("tolerance_ms", 5000))
                 pts, jpeg = ex.grab(int(msg["t_ms"]), bool(msg.get("accurate")), tolerance_ms=tol_ms)
@@ -81,6 +91,7 @@ def main() -> None:  # pragma: no cover - exercised through subprocess in integr
             elif op == "grab_batch":
                 if ex is None:
                     raise EngineError("internal", "not_open")
+                thumb(msg)
                 q0, b0 = ex.reader.requests, ex.reader.bytes_fetched
                 tol_ms = int(msg.get("tolerance_ms", 5000))
                 items = ex.grab_batch([int(x) for x in msg["targets_ms"]], tolerance_ms=tol_ms)
@@ -249,6 +260,7 @@ class WorkerEngine:
         self.max_duration_s = max_duration_s
         self.tolerance_ms = int(tolerance_ms)
         self.nearest_kf = bool(nearest_kf)
+        self.thumb: list[int] | None = None       # quality preset geometry for grabs (None: the worker's default, Standard)
         self.proc: WorkerProcess | None = None
         self.started_at = 0.0
 
@@ -278,8 +290,10 @@ class WorkerEngine:
             raise WorkerError("crash", "not_open", transient=True)
         tol = self.tolerance_ms if tolerance_ms is None else int(tolerance_ms)
         timeout = self.frame_timeout_s * (2 if accurate else 1)
-        r = self.proc.call({"op": "grab", "t_ms": int(t_ms), "accurate": bool(accurate),
-                            "tolerance_ms": tol}, timeout)
+        msg = {"op": "grab", "t_ms": int(t_ms), "accurate": bool(accurate), "tolerance_ms": tol}
+        if self.thumb is not None:
+            msg["thumb"] = list(self.thumb)
+        r = self.proc.call(msg, timeout)
         if not r.get("ok"):
             raise WorkerError(r.get("error", "internal"), r.get("detail", ""))
         return GrabResult(int(r["pts_ms"]), base64.b64decode(r["jpeg"]), int(r.get("requests", 0)),
@@ -305,8 +319,10 @@ class WorkerEngine:
         if not self.is_open():
             raise WorkerError("crash", "not_open", transient=True)
         timeout = self.frame_timeout_s * max(1, len(targets_ms))
-        r = self.proc.call({"op": "grab_batch", "targets_ms": [int(x) for x in targets_ms],
-                            "tolerance_ms": int(tolerance_ms)}, timeout)
+        msg = {"op": "grab_batch", "targets_ms": [int(x) for x in targets_ms], "tolerance_ms": int(tolerance_ms)}
+        if self.thumb is not None:
+            msg["thumb"] = list(self.thumb)
+        r = self.proc.call(msg, timeout)
         if not r.get("ok"):
             raise WorkerError(r.get("error", "internal"), r.get("detail", ""))
         out: list[tuple[int, bool, GrabResult]] = []
@@ -317,6 +333,9 @@ class WorkerEngine:
                             reqs if idx == 0 else 0, byts if idx == 0 else 0)
             out.append((int(it["t_ms"]), bool(it["accurate"]), gr))
         return out
+
+    def set_thumb(self, wire: list[int] | None) -> None:
+        self.thumb = list(wire) if wire is not None else None
 
     def kill(self) -> None:
         """Hard stop from another thread (cancel / idle / shutdown)."""

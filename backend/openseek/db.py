@@ -23,8 +23,8 @@ CREATE TABLE IF NOT EXISTS entries (
   fp TEXT PRIMARY KEY, duration_ms INTEGER, n_tiles INTEGER, version INTEGER NOT NULL DEFAULT 0,
   bytes INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, last_used REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS tiles (
-  fp TEXT NOT NULL, k INTEGER NOT NULL, pts_ms INTEGER NOT NULL, size INTEGER NOT NULL,
-  created REAL NOT NULL, PRIMARY KEY (fp, k));
+  fp TEXT NOT NULL, profile TEXT NOT NULL DEFAULT 't320x180q75g10v1', k INTEGER NOT NULL, pts_ms INTEGER NOT NULL,
+  size INTEGER NOT NULL, created REAL NOT NULL, PRIMARY KEY (fp, profile, k));
 CREATE TABLE IF NOT EXISTS invites (
   pair_id TEXT PRIMARY KEY, label TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'guest', salt TEXT NOT NULL,
   iterations INTEGER NOT NULL, k_hex TEXT NOT NULL, created REAL NOT NULL, expires REAL NOT NULL,
@@ -65,7 +65,22 @@ class DB:
         self._migrate()
 
     def _migrate(self) -> None:
-        """Additive only: devices gain a role (existing devices stay owners), an optional expiry and the invite used."""
+        """Additive only: devices gain a role (existing devices stay owners), an optional expiry and the invite used;
+        tiles gain the quality profile they were made at (every existing tile is Standard, the only one there was)."""
+        tile_cols = {r[1] for r in self.conn.execute("PRAGMA table_info(tiles)").fetchall()}
+        if tile_cols and "profile" not in tile_cols:
+            # the primary key changes, so the table is rebuilt (one transaction: all or nothing)
+            self.conn.executescript("""
+BEGIN;
+CREATE TABLE tiles_q (
+  fp TEXT NOT NULL, profile TEXT NOT NULL DEFAULT 't320x180q75g10v1', k INTEGER NOT NULL, pts_ms INTEGER NOT NULL,
+  size INTEGER NOT NULL, created REAL NOT NULL, PRIMARY KEY (fp, profile, k));
+INSERT INTO tiles_q(fp, profile, k, pts_ms, size, created)
+  SELECT fp, 't320x180q75g10v1', k, pts_ms, size, created FROM tiles;
+DROP TABLE tiles;
+ALTER TABLE tiles_q RENAME TO tiles;
+COMMIT;
+""")
         inv_cols = {r[1] for r in self.conn.execute("PRAGMA table_info(invites)").fetchall()}
         if inv_cols and "tag" not in inv_cols:
             self.conn.execute("ALTER TABLE invites ADD COLUMN tag TEXT")
@@ -116,7 +131,7 @@ class DB:
         out = []
         for fp, imdb, tmdb, season, episode, size, created, dur, n, tiles, used in self.q(
                 "SELECT m.fp, m.imdb_id, m.tmdb_id, m.season, m.episode, m.size_bytes, m.created, e.duration_ms, e.n_tiles, "
-                "(SELECT COUNT(*) FROM tiles t WHERE t.fp=m.fp), e.last_used FROM release_meta m "
+                "(SELECT COUNT(DISTINCT k) FROM tiles t WHERE t.fp=m.fp), e.last_used FROM release_meta m "
                 "LEFT JOIN entries e ON e.fp=m.fp ORDER BY m.created"):
             out.append({"fp": fp[:12], "imdb_id": imdb, "tmdb_id": tmdb, "season": season, "episode": episode,
                         "size_bytes": size, "duration_ms": dur, "tiles": tiles, "n_tiles": n, "last_used": used})
@@ -125,7 +140,7 @@ class DB:
     def release_candidates(self, imdb: str | None, tmdb: int | None, season: int, episode: int) -> list[tuple]:
         """(fp, size, duration_ms, n_tiles, tiles_done) of cache entries with the same id and season/episode."""
         return self.q(
-            "SELECT m.fp, m.size_bytes, e.duration_ms, e.n_tiles, (SELECT COUNT(*) FROM tiles t WHERE t.fp=m.fp) "
+            "SELECT m.fp, m.size_bytes, e.duration_ms, e.n_tiles, (SELECT COUNT(DISTINCT k) FROM tiles t WHERE t.fp=m.fp) "
             "FROM release_meta m JOIN entries e ON e.fp=m.fp WHERE m.season=? AND m.episode=? AND e.duration_ms > 0 "
             "AND ((? IS NOT NULL AND m.imdb_id=?) OR (? IS NOT NULL AND m.tmdb_id=?))",
             (season, episode, imdb, imdb, tmdb, tmdb))

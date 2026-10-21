@@ -65,6 +65,11 @@ QHeaderView::section {{ background: transparent; color: {MUTED}; border: none; p
 QCheckBox {{ spacing: 8px; }}
 QCheckBox::indicator {{ width: 34px; height: 18px; border-radius: 9px; background: #2b3040; }}
 QCheckBox::indicator:checked {{ background: {ACCENT}; }}
+QSlider::groove:horizontal {{ background: #2b3040; height: 6px; border-radius: 3px; }}
+QSlider::sub-page:horizontal {{ background: {ACCENT}; border-radius: 3px; }}
+QSlider::handle:horizontal {{ background: {TEXT}; width: 16px; margin: -6px 0; border-radius: 8px; }}
+QSlider::handle:horizontal:disabled {{ background: {FAINT}; }}
+QSlider::sub-page:horizontal:disabled {{ background: #2b3040; }}
 QToolTip {{ background: {CARD_HI}; color: {TEXT}; border: 1px solid {BORDER}; padding: 5px; }}
 QMenu {{ background: {SURFACE}; border: 1px solid {BORDER}; padding: 6px; border-radius: 10px; }}
 QMenu::item {{ padding: 6px 18px; border-radius: 6px; }}
